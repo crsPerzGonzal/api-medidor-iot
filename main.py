@@ -44,10 +44,11 @@ app = FastAPI(
 
 @app.post("/api/lecturas", status_code=status.HTTP_201_CREATED)
 async def crear_lectura(lectura: LecturaEnergia, request: Request) -> dict[str, str]:
-    fecha_hora = datetime.now().astimezone()
+    # Ajustado a 'fecha' para alinearse estrictamente con la Hypertable de la base de datos
+    fecha = datetime.now().astimezone()
     query = """
         INSERT INTO lecturas_energia (
-            fecha_hora,
+            fecha,
             id_dispositivo,
             voltaje_v,
             corriente_a,
@@ -60,7 +61,7 @@ async def crear_lectura(lectura: LecturaEnergia, request: Request) -> dict[str, 
         async with request.app.state.pool.acquire() as connection:
             await connection.execute(
                 query,
-                fecha_hora,
+                fecha,
                 lectura.id_dispositivo,
                 lectura.voltaje_v,
                 lectura.corriente_a,
@@ -86,16 +87,16 @@ async def promedio_ultima_hora(
             AVG(potencia_w) AS promedio_potencia_w
         FROM lecturas_energia
         WHERE id_dispositivo = $1
-          AND fecha_hora >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
+          AND fecha >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
     """
 
     async with request.app.state.pool.acquire() as connection:
         row = await connection.fetchrow(query, id_dispositivo)
 
     return {
-        "promedio_voltaje_v": row["promedio_voltaje_v"],
-        "promedio_corriente_a": row["promedio_corriente_a"],
-        "promedio_potencia_w": row["promedio_potencia_w"],
+        "promedio_voltaje_v": round(float(row["promedio_voltaje_v"]), 1) if row["promedio_voltaje_v"] is not None else 0.0,
+        "promedio_corriente_a": round(float(row["promedio_corriente_a"]), 2) if row["promedio_corriente_a"] is not None else 0.0,
+        "promedio_potencia_w": round(float(row["promedio_potencia_w"]), 1) if row["promedio_potencia_w"] is not None else 0.0,
     }
 
 
@@ -109,16 +110,70 @@ async def maximo_minimo_potencia(
             MIN(potencia_w) AS potencia_minima_w
         FROM lecturas_energia
         WHERE id_dispositivo = $1
-          AND fecha_hora::date = CURRENT_DATE
+          AND fecha::date = CURRENT_DATE
     """
 
     async with request.app.state.pool.acquire() as connection:
         row = await connection.fetchrow(query, id_dispositivo)
 
     return {
-        "potencia_maxima_w": row["potencia_maxima_w"],
-        "potencia_minima_w": row["potencia_minima_w"],
+        "potencia_maxima_w": round(float(row["potencia_maxima_w"]), 1) if row["potencia_maxima_w"] is not None else 0.0,
+        "potencia_minima_w": round(float(row["potencia_minima_w"]), 1) if row["potencia_minima_w"] is not None else 0.0,
     }
+
+
+
+@app.get("/api/analitica/tendencia/{id_dispositivo}")
+async def desviacion_y_tendencia(
+    id_dispositivo: int, request: Request
+) -> dict[str, float | str]:
+    query = """
+        SELECT 
+            STDDEV(potencia_w) AS desv_est,
+            REGR_SLOPE(potencia_w, EXTRACT(EPOCH FROM fecha)) AS pendiente
+        FROM lecturas_energia
+        WHERE id_dispositivo = $1 
+          AND fecha >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
+    """
+    async with request.app.state.pool.acquire() as connection:
+        row = await connection.fetchrow(query, id_dispositivo)
+        
+    desv = round(float(row["desv_est"]), 1) if row["desv_est"] is not None else 0.0
+    pendiente = float(row["pendiente"]) if row["pendiente"] is not None else 0.0
+    
+    # Determinar la tendencia del consumo en base a la pendiente analítica
+    tendencia_str = "Sube" if pendiente > 0.0001 else ("Baja" if pendiente < -0.0001 else "Estable")
+    
+    return {
+        "desv_est": desv,
+        "tendencia": tendencia_str
+    }
+
+
+
+@app.get("/api/analitica/outliers/{id_dispositivo}")
+async def deteccion_outliers_hoy(
+    id_dispositivo: int, request: Request
+) -> dict[str, int]:
+    query = """
+        WITH estadisticas AS (
+            SELECT 
+                AVG(potencia_w) AS media, 
+                STDDEV(potencia_w) AS desv 
+            FROM lecturas_energia 
+            WHERE id_dispositivo = $1
+        )
+        SELECT COUNT(*) AS total_outliers 
+        FROM lecturas_energia, estadisticas
+        WHERE id_dispositivo = $1 
+          AND fecha::date = CURRENT_DATE
+          AND desv > 0 -- Evita divisiones por cero o cálculos inválidos si hay un solo dato
+          AND (potencia_w > (media + 3 * desv) OR potencia_w < (media - 3 * desv));
+    """
+    async with request.app.state.pool.acquire() as connection:
+        row = await connection.fetchrow(query, id_dispositivo)
+        
+    return {"outliers_hoy": row["total_outliers"] if row["total_outliers"] is not None else 0}
 
 
 @app.get("/api/analitica/alertas-conteo/{id_dispositivo}")
@@ -127,10 +182,10 @@ async def conteo_alertas(id_dispositivo: int, request: Request) -> dict[str, int
         SELECT COUNT(*) AS total_alertas
         FROM alertas_generadas
         WHERE id_dispositivo = $1
-          AND fecha_hora::date = CURRENT_DATE
+          AND fecha::date = CURRENT_DATE
     """
 
     async with request.app.state.pool.acquire() as connection:
         row = await connection.fetchrow(query, id_dispositivo)
 
-    return {"total_alertas": row["total_alertas"]}
+    return {"total_alertas": row["total_alertas"] if row["total_alertas"] is not None else 0}
